@@ -1,0 +1,526 @@
+import React, { useState, useEffect, useMemo, useRef } from 'react';
+import { initializeApp } from 'firebase/app';
+import { 
+  getFirestore, 
+  collection, 
+  doc, 
+  setDoc, 
+  onSnapshot, 
+  addDoc, 
+  deleteDoc,
+  serverTimestamp
+} from 'firebase/firestore';
+import { 
+  getAuth, 
+  signInAnonymously, 
+  onAuthStateChanged,
+  signInWithCustomToken 
+} from 'firebase/auth';
+import { 
+  Calendar, 
+  User, 
+  Clock, 
+  AlertTriangle, 
+  Plus, 
+  X, 
+  CheckCircle2, 
+  Info,
+  ChevronLeft,
+  ChevronRight,
+  GraduationCap,
+  Plane,
+  UserX,
+  Edit2,
+  Users,
+  Trash2,
+  Briefcase,
+  LayoutDashboard,
+  School,
+  ChevronDown,
+  CalendarDays,
+  ArrowRight,
+  ChevronsLeft,
+  ChevronsRight,
+  Target
+} from 'lucide-react';
+
+// --- CONFIGURATION ---
+const firebaseConfig = JSON.parse(__firebase_config);
+const app = initializeApp(firebaseConfig);
+const auth = getAuth(app);
+const db = getFirestore(app);
+const appId = typeof __app_id !== 'undefined' ? __app_id : 'prod-school-manager-final';
+
+const STATUS_TYPES = {
+  PRESENT: { label: 'Présent', color: 'bg-green-500', lightColor: 'bg-green-50', textColor: 'text-green-700', icon: CheckCircle2 },
+  ABSENT: { label: 'Absence', color: 'bg-red-500', lightColor: 'bg-red-50', textColor: 'text-red-700', icon: UserX },
+  VACANCES: { label: 'Vacances', color: 'bg-blue-500', lightColor: 'bg-blue-50', textColor: 'text-blue-700', icon: Plane },
+  FORMATION: { label: 'Formation', color: 'bg-purple-500', lightColor: 'bg-purple-50', textColor: 'text-purple-700', icon: GraduationCap },
+  VOYAGE: { label: 'Dépl.', color: 'bg-amber-500', lightColor: 'bg-amber-50', textColor: 'text-amber-700', icon: Briefcase },
+};
+
+const SCHOOLS = Array.from({ length: 10 }, (_, i) => ({
+  id: `school-${i + 1}`,
+  name: `École ${String.fromCharCode(65 + i)}`,
+  location: `Secteur ${i + 1}`,
+  color: ['bg-blue-600', 'bg-indigo-600', 'bg-purple-600', 'bg-pink-600', 'bg-red-600', 'bg-orange-600', 'bg-amber-600', 'bg-green-600', 'bg-teal-600', 'bg-cyan-600'][i]
+}));
+
+const STAFF_ROLES = [
+  'Directeur/trice', 'Enseignant CM2', 'Enseignant CM1', 'Enseignant CE2', 
+  'Enseignant CE1', 'Enseignant CP', 'ATSEM', 'Gardien', 'Cantine', 'AESH'
+];
+
+export default function App() {
+  const [user, setUser] = useState(null);
+  const [currentSchool, setCurrentSchool] = useState(null);
+  const [staff, setStaff] = useState([]);
+  const [events, setEvents] = useState([]);
+  const [allEvents, setAllEvents] = useState({});
+  const [loading, setLoading] = useState(true);
+  const [selectedDate, setSelectedDate] = useState(new Date());
+  const [showModal, setShowModal] = useState(false);
+  const [activeStaff, setActiveStaff] = useState(null);
+  const [editingEvent, setEditingEvent] = useState(null);
+  const [showSchoolPicker, setShowSchoolPicker] = useState(false);
+  const [schoolMonthView, setSchoolMonthView] = useState(null);
+  
+  const scrollContainerRef = useRef(null);
+  const activeDayRef = useRef(null);
+  const schoolPickerRef = useRef(null);
+
+  // Initialisation Authentification
+  useEffect(() => {
+    const initAuth = async () => {
+      try {
+        if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+          await signInWithCustomToken(auth, __initial_auth_token);
+        } else {
+          await signInAnonymously(auth);
+        }
+      } catch (err) { console.error("Erreur Auth:", err); }
+    };
+    initAuth();
+    const unsubscribe = onAuthStateChanged(auth, setUser);
+    return () => unsubscribe();
+  }, []);
+
+  // Défilement horizontal intelligent sans affecter le scroll vertical
+  useEffect(() => {
+    if (currentSchool && activeDayRef.current && scrollContainerRef.current) {
+      const container = scrollContainerRef.current;
+      const element = activeDayRef.current;
+      const scrollLeft = element.offsetLeft - (container.offsetWidth / 2) + (element.offsetWidth / 2);
+      container.scrollTo({ left: scrollLeft, behavior: 'smooth' });
+    }
+  }, [selectedDate, currentSchool]);
+
+  // Fermeture du menu si clic extérieur
+  useEffect(() => {
+    const handleClickOutside = (event) => {
+      if (schoolPickerRef.current && !schoolPickerRef.current.contains(event.target)) {
+        setShowSchoolPicker(false);
+      }
+    };
+    document.addEventListener('mousedown', handleClickOutside);
+    return () => document.removeEventListener('mousedown', handleClickOutside);
+  }, []);
+
+  // Synchronisation globale des événements
+  useEffect(() => {
+    if (!user) return;
+    const eventsRef = collection(db, 'artifacts', appId, 'public', 'data', 'all_events');
+    const unsubscribe = onSnapshot(eventsRef, (snapshot) => {
+      const evs = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+      const grouped = evs.reduce((acc, curr) => {
+        if (!acc[curr.schoolId]) acc[curr.schoolId] = [];
+        acc[curr.schoolId].push(curr);
+        return acc;
+      }, {});
+      setAllEvents(grouped);
+      setLoading(false);
+    }, (err) => console.error("Erreur Sync Events:", err));
+    return () => unsubscribe();
+  }, [user]);
+
+  // Synchronisation du personnel et des événements locaux par école
+  useEffect(() => {
+    if (!user || !currentSchool) return;
+    const schoolId = currentSchool.id;
+    const staffRef = collection(db, 'artifacts', appId, 'public', 'data', 'schools', schoolId, 'staff');
+    
+    const unsubscribeStaff = onSnapshot(staffRef, (snapshot) => {
+      let staffData = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+      if (staffData.length === 0) {
+        STAFF_ROLES.forEach((role, i) => {
+          const s = { id: `staff-${i}`, name: `Agent ${i + 1}`, role };
+          setDoc(doc(staffRef, s.id), s);
+        });
+      } else {
+        setStaff(staffData.sort((a,b) => a.id.localeCompare(b.id)));
+      }
+    });
+
+    const eventsRef = collection(db, 'artifacts', appId, 'public', 'data', 'all_events');
+    const unsubscribeEvents = onSnapshot(eventsRef, (snapshot) => {
+      const evs = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }))
+                       .filter(e => e.schoolId === schoolId);
+      setEvents(evs);
+    });
+
+    return () => { unsubscribeStaff(); unsubscribeEvents(); };
+  }, [user, currentSchool]);
+
+  const weekDays = useMemo(() => {
+    const start = new Date(selectedDate);
+    const dayOfWeek = start.getDay();
+    const diff = start.getDate() - dayOfWeek + (dayOfWeek === 0 ? -6 : 1);
+    const monday = new Date(start.setDate(diff));
+    return Array.from({ length: 7 }, (_, i) => {
+      const day = new Date(monday);
+      day.setDate(monday.getDate() + i);
+      return day;
+    });
+  }, [selectedDate]);
+
+  const formatDate = (date) => new Date(date).toISOString().split('T')[0];
+
+  const getStatus = (staffId, date, eventList = events) => {
+    const dateStr = formatDate(date);
+    const matches = eventList
+      .filter(e => e.staffId === staffId && dateStr >= e.startDate && dateStr <= e.endDate)
+      .sort((a, b) => (b.updatedAt?.seconds || 0) - (a.updatedAt?.seconds || 0));
+    return matches.length > 0 ? matches[0].type : 'PRESENT';
+  };
+
+  // --- FONCTIONS DE NAVIGATION ---
+  const resetToToday = () => setSelectedDate(new Date());
+  const jumpMonths = (val) => {
+    const d = new Date(selectedDate);
+    d.setMonth(d.getMonth() + val);
+    setSelectedDate(d);
+  };
+  const jumpWeeks = (val) => {
+    const d = new Date(selectedDate);
+    d.setDate(d.getDate() + (val * 7));
+    setSelectedDate(d);
+  };
+
+  const handleSubmit = async (e) => {
+    e.preventDefault();
+    const formData = new FormData(e.target);
+    const type = formData.get('type');
+    const eventsRef = collection(db, 'artifacts', appId, 'public', 'data', 'all_events');
+    try {
+      if (type === 'PRESENT') {
+        if (editingEvent) await deleteDoc(doc(eventsRef, editingEvent.id));
+      } else {
+        const data = {
+          schoolId: currentSchool.id,
+          staffId: activeStaff.id,
+          type,
+          startDate: formData.get('startDate'),
+          endDate: formData.get('endDate'),
+          note: formData.get('note'),
+          updatedAt: serverTimestamp()
+        };
+        if (editingEvent) await setDoc(doc(eventsRef, editingEvent.id), data);
+        else await addDoc(eventsRef, data);
+      }
+      setShowModal(false);
+      setEditingEvent(null);
+    } catch (err) { console.error(err); }
+  };
+
+  const deleteEvent = async (id) => {
+    try { await deleteDoc(doc(db, 'artifacts', appId, 'public', 'data', 'all_events', id)); }
+    catch (err) { console.error(err); }
+  };
+
+  // Composant interne pour la navigation
+  const DateNavigation = () => (
+    <div className="flex items-center gap-1 bg-slate-100 p-1 rounded-2xl border border-slate-200 shadow-inner">
+      <button onClick={() => jumpMonths(-1)} className="p-2 hover:bg-white rounded-xl transition-all text-slate-400 hover:text-blue-600"><ChevronsLeft size={18} /></button>
+      <button onClick={() => jumpWeeks(-1)} className="p-2 hover:bg-white rounded-xl transition-all text-slate-500"><ChevronLeft size={18} /></button>
+      
+      <div className="relative group mx-1">
+        <input type="date" className="absolute inset-0 opacity-0 cursor-pointer w-full" value={formatDate(selectedDate)} onChange={(e) => setSelectedDate(new Date(e.target.value))} />
+        <div className="px-3 py-1.5 bg-white rounded-xl border border-slate-200 shadow-sm text-[10px] font-black uppercase text-blue-700 pointer-events-none flex items-center gap-2">
+          <Calendar size={12} /> {selectedDate.toLocaleDateString('fr-FR', { month: 'short', year: 'numeric' }).toUpperCase()}
+        </div>
+      </div>
+
+      <button onClick={() => jumpWeeks(1)} className="p-2 hover:bg-white rounded-xl transition-all text-slate-500"><ChevronRight size={18} /></button>
+      <button onClick={() => jumpMonths(1)} className="p-2 hover:bg-white rounded-xl transition-all text-slate-400 hover:text-blue-600"><ChevronsRight size={18} /></button>
+    </div>
+  );
+
+  const MonthView = ({ school, onClose }) => {
+    const schoolEvents = allEvents[school.id] || [];
+    const days = useMemo(() => {
+      const y = selectedDate.getFullYear(), m = selectedDate.getMonth();
+      const first = new Date(y, m, 1), last = new Date(y, m + 1, 0);
+      const res = [];
+      const pad = first.getDay() === 0 ? 6 : first.getDay() - 1;
+      for (let i = 0; i < pad; i++) res.push(null);
+      for (let i = 1; i <= last.getDate(); i++) res.push(new Date(y, m, i));
+      return res;
+    }, [selectedDate]);
+
+    return (
+      <div className="fixed inset-0 bg-slate-900/60 backdrop-blur-md z-[70] flex items-center justify-center p-4">
+        <div className="bg-white w-full max-w-lg rounded-[40px] shadow-2xl overflow-hidden animate-in zoom-in duration-200">
+          <div className={`p-6 text-white ${school.color} flex justify-between items-center`}>
+            <div className="flex items-center gap-3">
+              <CalendarDays size={28} />
+              <div>
+                <h2 className="text-xl font-black uppercase italic leading-none">Vue Mensuelle</h2>
+                <p className="text-[10px] font-bold opacity-80 mt-1 uppercase">{school.name}</p>
+              </div>
+            </div>
+            <button onClick={onClose} className="p-2 bg-white/20 rounded-full"><X size={24} /></button>
+          </div>
+          <div className="p-6">
+            <div className="grid grid-cols-7 gap-1 mb-2 text-center text-[9px] font-black text-slate-400">
+              {['LUN','MAR','MER','JEU','VEN','SAM','DIM'].map(d => <div key={d}>{d}</div>)}
+            </div>
+            <div className="grid grid-cols-7 gap-2">
+              {days.map((day, idx) => {
+                if (!day) return <div key={idx}></div>;
+                const dStr = formatDate(day);
+                const abs = schoolEvents.filter(e => dStr >= e.startDate && dStr <= e.endDate).length;
+                const pres = 10 - abs;
+                const isAlert = pres < 8;
+                return (
+                  <button key={dStr} onClick={() => { setSelectedDate(day); setCurrentSchool(school); onClose(); }} 
+                    className={`aspect-square rounded-2xl border flex flex-col items-center justify-center transition-all ${isAlert ? 'bg-red-50 border-red-200 text-red-600' : 'bg-slate-50 border-slate-100 text-slate-800'}`}>
+                    <span className="text-[8px] font-black">{day.getDate()}</span>
+                    <span className="text-xs font-black">{pres}</span>
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+        </div>
+      </div>
+    );
+  };
+
+  if (loading) return (
+    <div className="flex items-center justify-center h-screen bg-slate-900">
+      <div className="text-center">
+        <div className="animate-spin rounded-full h-10 w-10 border-b-2 border-blue-500 mx-auto mb-4"></div>
+        <p className="text-white text-[10px] font-black uppercase tracking-widest">Initialisation Pro...</p>
+      </div>
+    </div>
+  );
+
+  // --- RENDU DASHBOARD ---
+  if (!currentSchool) {
+    return (
+      <div className="min-h-screen bg-slate-50 pb-24">
+        <header className="bg-white border-b p-6 sticky top-0 z-30 shadow-sm flex flex-col sm:flex-row justify-between items-center gap-4">
+          <div className="flex items-center gap-3">
+            <div className="bg-blue-600 p-2 rounded-2xl text-white shadow-lg shadow-blue-200"><LayoutDashboard size={24}/></div>
+            <div>
+              <h1 className="text-xl font-black text-slate-800 italic uppercase leading-none">Central RH</h1>
+              <p className="text-[9px] font-bold text-slate-400 mt-1 uppercase">Pilotage 10 Établissements</p>
+            </div>
+          </div>
+          <div className="flex items-center gap-2">
+            <button onClick={resetToToday} className="p-3 bg-blue-50 text-blue-600 rounded-2xl shadow-sm hover:bg-blue-600 hover:text-white transition-all"><Target size={20}/></button>
+            <DateNavigation />
+          </div>
+        </header>
+
+        <main className="max-w-6xl mx-auto p-4 grid grid-cols-1 lg:grid-cols-2 gap-6">
+          {SCHOOLS.map(school => {
+            const schoolEvents = allEvents[school.id] || [];
+            const weekly = weekDays.map(day => {
+              const dStr = formatDate(day);
+              const abs = schoolEvents.filter(e => dStr >= e.startDate && dStr <= e.endDate).length;
+              return { date: day, pres: 10 - abs, isAlert: (10 - abs) < 8 };
+            });
+            const globalAlert = weekly.some(w => w.isAlert);
+
+            return (
+              <div key={school.id} className="bg-white rounded-[40px] p-6 shadow-sm border-2 border-transparent hover:border-blue-500/20 transition-all flex flex-col gap-6">
+                <div className="flex justify-between items-center">
+                  <div className="flex items-center gap-4">
+                    <button onClick={() => setCurrentSchool(school)} className={`w-14 h-14 rounded-[20px] ${school.color} text-white flex items-center justify-center shadow-xl active:scale-90 transition-transform`}><School size={28}/></button>
+                    <div>
+                      <button onClick={() => setCurrentSchool(school)} className="text-xl font-black text-slate-800 italic uppercase hover:text-blue-600">{school.name}</button>
+                      <p className="text-[10px] font-bold text-slate-300 uppercase tracking-widest">{school.location}</p>
+                    </div>
+                  </div>
+                  <div className="flex gap-2">
+                    <button onClick={() => setSchoolMonthView(school)} className="p-3 bg-slate-50 text-slate-400 rounded-2xl hover:bg-blue-600 hover:text-white transition-all shadow-sm"><CalendarDays size={20}/></button>
+                    {globalAlert && <div className="bg-red-500 text-white px-3 py-1 rounded-xl text-[8px] font-black animate-pulse flex items-center">ALERTE</div>}
+                  </div>
+                </div>
+                
+                <div className="grid grid-cols-7 gap-2">
+                  {weekly.map((stat, idx) => (
+                    <button key={idx} onClick={() => handleDayClickFromDashboard(school, stat.date)} className="flex flex-col items-center gap-1 group/day">
+                      <span className="text-[8px] font-black text-slate-400 uppercase">{stat.date.toLocaleDateString('fr-FR', { weekday: 'short' }).slice(0, 2).toUpperCase()}</span>
+                      <div className={`w-full h-16 rounded-[18px] flex flex-col items-center justify-center border transition-all ${stat.isAlert ? 'bg-red-50 border-red-200 text-red-600 shadow-inner' : 'bg-green-50 border-green-100 text-green-600'} group-hover/day:scale-105 active:scale-95`}>
+                        <span className="text-[8px] font-black opacity-60 mb-1">{stat.date.toLocaleDateString('fr-FR', { day: 'numeric', month: 'short' }).replace('.','').toUpperCase()}</span>
+                        <div className="h-[1px] w-1/2 bg-current opacity-20 my-1"></div>
+                        <span className="text-[12px] font-black">{stat.pres}/10</span>
+                      </div>
+                    </button>
+                  ))}
+                </div>
+              </div>
+            );
+          })}
+        </main>
+        {schoolMonthView && <MonthView school={schoolMonthView} onClose={() => setSchoolMonthView(null)} />}
+      </div>
+    );
+  }
+
+  // --- RENDU VUE ÉCOLE ---
+  return (
+    <div className="min-h-screen bg-slate-50 pb-24">
+      <header className="bg-white border-b sticky top-0 z-30 px-4 py-3 shadow-sm flex flex-col sm:flex-row justify-between items-center gap-4">
+        <div className="flex items-center gap-3 self-start sm:self-auto relative" ref={schoolPickerRef}>
+          <button onClick={() => setCurrentSchool(null)} className="p-3 bg-slate-50 text-slate-400 rounded-2xl"><LayoutDashboard size={20}/></button>
+          <button onClick={() => setShowSchoolPicker(!showSchoolPicker)} className="flex items-center gap-3 p-1.5 pr-4 bg-slate-50 rounded-2xl border border-transparent hover:border-slate-200 active:scale-95 transition-all">
+            <div className={`w-10 h-10 rounded-xl ${currentSchool.color} text-white flex items-center justify-center shadow-lg shadow-blue-100`}><School size={20}/></div>
+            <div className="text-left leading-none">
+              <h1 className="text-lg font-black italic uppercase flex items-center gap-2">{currentSchool.name} <ChevronDown size={16}/></h1>
+              <p className="text-[9px] font-bold text-blue-600 uppercase tracking-widest mt-1">Sélecteur Rapide</p>
+            </div>
+          </button>
+          {showSchoolPicker && (
+            <div className="absolute top-full left-10 mt-3 w-64 bg-white rounded-[32px] shadow-2xl border border-slate-100 p-3 z-[60] animate-in slide-in-from-top-2 duration-200">
+              <div className="px-4 py-2 border-b border-slate-50 mb-2"><span className="text-[10px] font-black text-slate-400 uppercase">Changer d'école</span></div>
+              <div className="max-h-[350px] overflow-y-auto no-scrollbar">
+                {SCHOOLS.map(s => (
+                  <button key={s.id} onClick={() => { setCurrentSchool(s); setShowSchoolPicker(false); }} className={`w-full flex items-center gap-3 p-3 rounded-2xl mb-1 ${currentSchool.id === s.id ? 'bg-blue-50 ring-1 ring-blue-100' : 'hover:bg-slate-50'}`}>
+                    <div className={`w-8 h-8 rounded-lg ${s.color} text-white text-[10px] font-black flex items-center justify-center`}>{s.name.split(' ')[1]}</div>
+                    <div className="text-left font-black uppercase italic text-xs">{s.name}</div>
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
+        </div>
+        <div className="flex items-center gap-2">
+          <button onClick={() => setSchoolMonthView(currentSchool)} className="p-3 bg-slate-50 text-slate-500 rounded-2xl shadow-sm"><CalendarDays size={20}/></button>
+          <button onClick={resetToToday} className="p-3 bg-blue-50 text-blue-600 rounded-2xl shadow-sm"><Target size={20}/></button>
+          <DateNavigation />
+        </div>
+      </header>
+
+      <main className="max-w-5xl mx-auto p-4 space-y-6">
+        {/* Bandeau des Dates */}
+        <div ref={scrollContainerRef} className="flex overflow-x-auto gap-3 pb-2 no-scrollbar scroll-smooth">
+          {weekDays.map((day, idx) => {
+            const count = staff.filter(s => getStatus(s.id, day) === 'PRESENT').length;
+            const isSelected = formatDate(selectedDate) === formatDate(day);
+            return (
+              <button key={idx} ref={isSelected ? activeDayRef : null} onClick={() => setSelectedDate(new Date(day))} 
+                className={`flex-shrink-0 w-28 p-4 rounded-3xl border text-center transition-all ${isSelected ? 'border-blue-600 bg-blue-600 text-white shadow-xl shadow-blue-200 scale-105 z-10' : 'bg-white border-slate-100 shadow-sm text-slate-800'}`}>
+                <div className={`text-[10px] font-black uppercase mb-1 ${isSelected ? 'opacity-80' : 'text-slate-400'}`}>{day.toLocaleDateString('fr-FR', { weekday: 'short' }).toUpperCase()}</div>
+                <div className="text-xs font-black mb-2">{day.toLocaleDateString('fr-FR', { day: 'numeric', month: 'short' }).toUpperCase()}</div>
+                <div className={`text-lg font-black ${count < 8 ? (isSelected ? 'text-white' : 'text-red-600') : ''}`}>{count}/10</div>
+              </button>
+            );
+          })}
+        </div>
+
+        {/* Liste Personnel */}
+        <div className="grid gap-4">
+          {staff.map(member => (
+            <div key={member.id} className="bg-white rounded-[32px] p-5 shadow-sm border border-slate-100 flex flex-col gap-5 hover:border-blue-300 transition-colors">
+              <div className="flex justify-between items-center px-2">
+                <div className="flex items-center gap-3">
+                  <div className={`w-10 h-10 rounded-xl ${currentSchool.color} bg-opacity-10 text-blue-600 flex items-center justify-center font-black text-xs`}>{member.id.split('-')[1]}</div>
+                  <h3 className="text-sm font-black uppercase italic text-slate-800 tracking-tight">{member.role}</h3>
+                </div>
+              </div>
+              <div className="grid grid-cols-7 gap-2">
+                {weekDays.map((day, idx) => {
+                  const status = getStatus(member.id, day);
+                  const Config = STATUS_TYPES[status];
+                  const isSelected = formatDate(selectedDate) === formatDate(day);
+                  const IconComp = Config.icon;
+                  return (
+                    <button key={idx} 
+                      onClick={() => { setActiveStaff(member); setSelectedDate(new Date(day)); setEditingEvent(events.find(e => e.staffId === member.id && formatDate(day) >= e.startDate && formatDate(day) <= e.endDate)); setShowModal(true); }}
+                      className={`h-16 rounded-[22px] flex flex-col items-center justify-center border transition-all ${isSelected ? 'border-blue-500 bg-white ring-4 ring-blue-50 shadow-inner' : 'border-transparent ' + Config.lightColor}`}>
+                      <span className="text-[9px] font-black mb-1 opacity-40">{day.toLocaleDateString('fr-FR', { weekday: 'short' }).slice(0, 2).toUpperCase()}</span>
+                      <IconComp size={18} className={Config.textColor} />
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+          ))}
+        </div>
+      </main>
+
+      {/* MODAL MISE À JOUR */}
+      {showModal && (
+        <div className="fixed inset-0 bg-slate-900/60 backdrop-blur-md z-[80] flex items-end sm:items-center justify-center">
+          <div className="bg-white w-full max-w-md rounded-t-[40px] sm:rounded-[40px] p-8 shadow-2xl animate-in slide-in-from-bottom duration-300">
+            <div className="flex justify-between items-center mb-8">
+              <div>
+                <h2 className="text-2xl font-black uppercase italic text-slate-800">Mise à jour</h2>
+                <p className="text-[10px] font-bold text-blue-600 uppercase tracking-widest">{activeStaff?.role}</p>
+              </div>
+              <button onClick={() => setShowModal(false)} className="p-3 bg-slate-100 rounded-full"><X size={24} /></button>
+            </div>
+            <form onSubmit={handleSubmit} className="space-y-8">
+              <div>
+                <label className="text-[10px] font-black text-slate-400 uppercase block mb-4 ml-1">Catégorie du mouvement</label>
+                <div className="grid grid-cols-5 gap-3">
+                  {Object.entries(STATUS_TYPES).map(([key, config]) => {
+                    const ModalIcon = config.icon;
+                    return (
+                      <label key={key} className="cursor-pointer group">
+                        <input type="radio" name="type" value={key} defaultChecked={editingEvent ? editingEvent.type === key : key === 'ABSENT'} className="peer sr-only" />
+                        <div className="aspect-square border-2 border-slate-100 rounded-2xl flex flex-col items-center justify-center gap-1.5 transition-all peer-checked:border-blue-500 peer-checked:bg-blue-50 peer-checked:shadow-lg peer-checked:shadow-blue-100">
+                          <ModalIcon size={20} className={config.textColor} />
+                          <span className="text-[7px] font-black uppercase text-slate-500">{config.label}</span>
+                        </div>
+                      </label>
+                    );
+                  })}
+                </div>
+              </div>
+              <div className="grid grid-cols-2 gap-4">
+                <div className="space-y-2">
+                  <label className="text-[10px] font-black text-slate-400 uppercase ml-1">Début</label>
+                  <input type="date" name="startDate" defaultValue={editingEvent?.startDate || formatDate(selectedDate)} required className="w-full p-5 bg-slate-50 rounded-3xl font-black text-sm border-none focus:ring-2 focus:ring-blue-500" />
+                </div>
+                <div className="space-y-2">
+                  <label className="text-[10px] font-black text-slate-400 uppercase ml-1">Fin</label>
+                  <input type="date" name="endDate" defaultValue={editingEvent?.endDate || formatDate(selectedDate)} required className="w-full p-5 bg-slate-50 rounded-3xl font-black text-sm border-none focus:ring-2 focus:ring-blue-500" />
+                </div>
+              </div>
+              <div className="flex flex-col gap-4">
+                <button type="submit" className="w-full py-6 bg-blue-600 text-white rounded-[24px] font-black uppercase tracking-widest shadow-2xl shadow-blue-200 active:scale-95 transition-all">Valider les changements</button>
+                {editingEvent && <button type="button" onClick={() => { deleteEvent(editingEvent.id); setShowModal(false); }} className="w-full py-4 text-red-500 font-black text-[10px] uppercase tracking-[0.2em] flex justify-center gap-2 italic"><Trash2 size={16} /> Remettre l'agent présent</button>}
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+      
+      {schoolMonthView && <MonthView school={schoolMonthView} onClose={() => setSchoolMonthView(null)} />}
+
+      <nav className="fixed bottom-0 inset-x-0 bg-white border-t p-4 flex justify-around items-center sm:hidden z-40 shadow-[0_-10px_30px_rgba(0,0,0,0.05)] rounded-t-[32px]">
+        <button onClick={() => setCurrentSchool(null)} className="flex flex-col items-center gap-1.5 text-slate-400 transition-colors active:text-blue-600">
+          <LayoutDashboard size={22}/><span className="text-[9px] font-black uppercase tracking-tighter">Dashboard</span>
+        </button>
+        <div className="h-10 w-px bg-slate-100"></div>
+        <button onClick={resetToToday} className="flex flex-col items-center gap-1.5 text-blue-600">
+          <Target size={22}/><span className="text-[9px] font-black uppercase tracking-tighter">Aujourd'hui</span>
+        </button>
+      </nav>
+    </div>
+  );
+}
